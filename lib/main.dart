@@ -1,11 +1,9 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
-import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
 
@@ -38,73 +36,13 @@ class TamilVoiceApp extends StatelessWidget {
   }
 }
 
-/// Edge TTS client (same service the website uses). Voice is fixed to Tamil female.
+/// Uses the same Hugging Face Space as the website. Voice fixed to Tamil female.
 class EdgeTts {
-  static const _token = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-  static const _voice = 'ta-IN-PallaviNeural';
-  static const _chromium = '143.0.3650.75';
+  static const _base = 'https://innoai-edge-tts-text-to-speech.hf.space';
+  static const _voice = 'ta-IN-PallaviNeural - ta-IN (Female)';
 
-  /// Difference (in seconds) between Microsoft's clock and the phone's clock.
-  static int _skew = 0;
-
-  static DateTime _now() =>
-      DateTime.now().toUtc().add(Duration(seconds: _skew));
-
-  /// Read the server's time so a wrong phone clock does not break the login token.
-  static Future<void> _syncClock() async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
-    try {
-      final req = await client.getUrl(Uri.parse(
-          'https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=$_token'));
-      req.headers.set('User-Agent',
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0');
-      req.headers.set('Origin', 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold');
-      final res = await req.close().timeout(const Duration(seconds: 10));
-      final dateHeader = res.headers.value('date');
-      await res.drain();
-      if (dateHeader != null) {
-        final server = HttpDate.parse(dateHeader).toUtc();
-        _skew = server.difference(DateTime.now().toUtc()).inSeconds;
-      }
-    } catch (_) {
-      // ignore: keep previous skew
-    } finally {
-      client.close(force: true);
-    }
-  }
-
-  static String _gec() {
-    var t = _now().millisecondsSinceEpoch ~/ 1000 + 11644473600;
-    t -= t % 300;
-    final ticks = t * 10000000;
-    return sha256.convert(ascii.encode('$ticks$_token')).toString().toUpperCase();
-  }
-
-  static String _id() {
-    final r = Random.secure();
-    return List.generate(32, (_) => r.nextInt(16).toRadixString(16)).join();
-  }
-
-  static String _muid() => _id().toUpperCase();
-
-  static String _timestamp() {
-    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    final n = _now();
-    String p(int v) => v.toString().padLeft(2, '0');
-    return '${days[n.weekday - 1]} ${months[n.month - 1]} ${p(n.day)} ${n.year} '
-        '${p(n.hour)}:${p(n.minute)}:${p(n.second)} GMT+0000 (Coordinated Universal Time)';
-  }
-
-  static String _escape(String s) => s
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&apos;');
-
-  /// Split unlimited text into small pieces the service accepts.
-  static List<String> split(String text, {int maxChars = 700}) {
+  /// Split unlimited text into small pieces.
+  static List<String> split(String text, {int maxChars = 500}) {
     final clean = text.replaceAll(RegExp(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F]'), ' ');
     final parts = clean.split(RegExp(r'(?<=[.!?।\n])'));
     final chunks = <String>[];
@@ -132,62 +70,60 @@ class EdgeTts {
     return chunks;
   }
 
-  static Future<Uint8List> _synthChunk(String text, int rate, int pitch) async {
-    final url = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
-        '?TrustedClientToken=$_token&ConnectionId=${_id()}'
-        '&Sec-MS-GEC=${_gec()}&Sec-MS-GEC-Version=1-$_chromium';
-
-    final major = _chromium.split('.').first;
-    final ws = await WebSocket.connect(url, headers: {
-      'Pragma': 'no-cache',
-      'Cache-Control': 'no-cache',
-      'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-      'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-              'Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cookie': 'muid=${_muid()};',
-    }).timeout(const Duration(seconds: 20));
-
-    final out = BytesBuilder();
-    final done = Completer<void>();
-
-    ws.listen((msg) {
-      if (msg is String) {
-        if (msg.contains('Path:turn.end') && !done.isCompleted) done.complete();
-      } else if (msg is List<int>) {
-        final b = Uint8List.fromList(msg);
-        if (b.length < 2) return;
-        final hl = (b[0] << 8) | b[1];
-        if (b.length < 2 + hl) return;
-        final header = utf8.decode(b.sublist(2, 2 + hl), allowMalformed: true);
-        if (header.contains('Path:audio')) out.add(b.sublist(2 + hl));
-      }
-    }, onError: (e) {
-      if (!done.isCompleted) done.completeError(e);
-    }, onDone: () {
-      if (!done.isCompleted) done.complete();
-    });
-
-    final ts = _timestamp();
-    ws.add('X-Timestamp:$ts\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n'
-        '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false",'
-        '"wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n');
-
-    final rateStr = '${rate >= 0 ? '+' : ''}$rate%';
-    final pitchStr = '${pitch >= 0 ? '+' : ''}${pitch}Hz';
-    final ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='ta-IN'>"
-        "<voice name='$_voice'><prosody pitch='$pitchStr' rate='$rateStr' volume='+0%'>"
-        '${_escape(text)}</prosody></voice></speak>';
-    ws.add('X-RequestId:${_id()}\r\nContent-Type:application/ssml+xml\r\n'
-        'X-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml');
-
+  static Future<Uint8List> _chunk(String text, int rate, int pitch) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
     try {
-      await done.future.timeout(const Duration(seconds: 60));
+      // 1) Send the request
+      final post = await client.postUrl(Uri.parse('$_base/gradio_api/call/tts_interface'));
+      post.headers.contentType = ContentType.json;
+      post.add(utf8.encode(jsonEncode({
+        'data': [text, _voice, rate, pitch]
+      })));
+      final pr = await post.close().timeout(const Duration(seconds: 120));
+      final pBody = await pr.transform(utf8.decoder).join();
+      if (pr.statusCode != 200) {
+        throw Exception('Server not available (HTTP ${pr.statusCode})');
+      }
+      final eventId = (jsonDecode(pBody) as Map)['event_id'];
+      if (eventId == null) throw Exception('No event id from server');
+
+      // 2) Read the result
+      final get = await client.getUrl(Uri.parse('$_base/gradio_api/call/tts_interface/$eventId'));
+      final gr = await get.close().timeout(const Duration(seconds: 120));
+      final body = await gr.transform(utf8.decoder).join().timeout(const Duration(seconds: 180));
+
+      String? event;
+      String? result;
+      String? error;
+      for (final raw in body.split('\n')) {
+        final line = raw.trim();
+        if (line.startsWith('event:')) {
+          event = line.substring(6).trim();
+        } else if (line.startsWith('data:')) {
+          final d = line.substring(5).trim();
+          if (event == 'complete') result = d;
+          if (event == 'error') error = d;
+        }
+      }
+      if (result == null) throw Exception(error ?? 'No audio returned by server');
+
+      final list = jsonDecode(result) as List;
+      final file = list.isNotEmpty ? list[0] : null;
+      if (file == null || file is! Map) throw Exception('Server returned no audio');
+      final url = (file['url'] as String?) ?? '$_base/gradio_api/file=${file['path']}';
+
+      // 3) Download the MP3
+      final dl = await client.getUrl(Uri.parse(url));
+      final dr = await dl.close().timeout(const Duration(seconds: 120));
+      if (dr.statusCode != 200) throw Exception('Audio download failed (HTTP ${dr.statusCode})');
+      final b = BytesBuilder();
+      await for (final d in dr.timeout(const Duration(seconds: 120))) {
+        b.add(d);
+      }
+      return b.toBytes();
     } finally {
-      await ws.close();
+      client.close(force: true);
     }
-    return out.toBytes();
   }
 
   static Future<Uint8List> synthesize(
@@ -198,15 +134,14 @@ class EdgeTts {
   }) async {
     final chunks = split(text);
     if (chunks.isEmpty) throw Exception('Please enter some text.');
-    await _syncClock();
     final all = BytesBuilder();
     for (var i = 0; i < chunks.length; i++) {
       onProgress?.call(i, chunks.length);
       Uint8List? data;
       Object? lastErr;
-      for (var attempt = 0; attempt < 4 && data == null; attempt++) {
+      for (var attempt = 0; attempt < 3 && data == null; attempt++) {
         try {
-          final d = await _synthChunk(chunks[i], rate, pitch);
+          final d = await _chunk(chunks[i], rate, pitch);
           if (d.isNotEmpty) {
             data = d;
           } else {
@@ -214,8 +149,7 @@ class EdgeTts {
           }
         } catch (e) {
           lastErr = e;
-          await Future.delayed(const Duration(seconds: 1));
-          await _syncClock();
+          await Future.delayed(const Duration(seconds: 2));
         }
       }
       if (data == null) throw Exception('Failed on part ${i + 1}/${chunks.length}: $lastErr');
@@ -268,7 +202,7 @@ class _HomePageState extends State<HomePage> {
       _busy = true;
       _playing = false;
       _audio = null;
-      _status = 'Generating audio...';
+      _status = 'Generating audio... (the first time may take up to a minute)';
     });
     try {
       final bytes = await EdgeTts.synthesize(
@@ -352,8 +286,8 @@ class _HomePageState extends State<HomePage> {
             Slider(
               value: _rate,
               min: -50,
-              max: 100,
-              divisions: 150,
+              max: 50,
+              divisions: 100,
               onChanged: _busy ? null : (v) => setState(() => _rate = v),
             ),
             Text('Pitch: ${_pitch.round()} Hz'),
