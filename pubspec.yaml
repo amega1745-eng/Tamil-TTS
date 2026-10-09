@@ -1,0 +1,17 @@
+name: tamil_tts
+description: Tamil text to speech (female voice) with MP3 download.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  audioplayers: ^6.1.0
+  crypto: ^3.0.3
+  flutter_file_dialog: ^3.0.2
+
+flutter:
+  uses-material-design: true
