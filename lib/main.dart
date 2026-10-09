@@ -44,8 +44,37 @@ class EdgeTts {
   static const _voice = 'ta-IN-PallaviNeural';
   static const _chromium = '143.0.3650.75';
 
+  /// Difference (in seconds) between Microsoft's clock and the phone's clock.
+  static int _skew = 0;
+
+  static DateTime _now() =>
+      DateTime.now().toUtc().add(Duration(seconds: _skew));
+
+  /// Read the server's time so a wrong phone clock does not break the login token.
+  static Future<void> _syncClock() async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final req = await client.getUrl(Uri.parse(
+          'https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=$_token'));
+      req.headers.set('User-Agent',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0');
+      req.headers.set('Origin', 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold');
+      final res = await req.close().timeout(const Duration(seconds: 10));
+      final dateHeader = res.headers.value('date');
+      await res.drain();
+      if (dateHeader != null) {
+        final server = HttpDate.parse(dateHeader).toUtc();
+        _skew = server.difference(DateTime.now().toUtc()).inSeconds;
+      }
+    } catch (_) {
+      // ignore: keep previous skew
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   static String _gec() {
-    var t = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000 + 11644473600;
+    var t = _now().millisecondsSinceEpoch ~/ 1000 + 11644473600;
     t -= t % 300;
     final ticks = t * 10000000;
     return sha256.convert(ascii.encode('$ticks$_token')).toString().toUpperCase();
@@ -56,10 +85,12 @@ class EdgeTts {
     return List.generate(32, (_) => r.nextInt(16).toRadixString(16)).join();
   }
 
+  static String _muid() => _id().toUpperCase();
+
   static String _timestamp() {
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    final n = DateTime.now().toUtc();
+    final n = _now();
     String p(int v) => v.toString().padLeft(2, '0');
     return '${days[n.weekday - 1]} ${months[n.month - 1]} ${p(n.day)} ${n.year} '
         '${p(n.hour)}:${p(n.minute)}:${p(n.second)} GMT+0000 (Coordinated Universal Time)';
@@ -106,14 +137,16 @@ class EdgeTts {
         '?TrustedClientToken=$_token&ConnectionId=${_id()}'
         '&Sec-MS-GEC=${_gec()}&Sec-MS-GEC-Version=1-$_chromium';
 
+    final major = _chromium.split('.').first;
     final ws = await WebSocket.connect(url, headers: {
       'Pragma': 'no-cache',
       'Cache-Control': 'no-cache',
       'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
       'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-              'Chrome/${_chromium.split('.').first}.0.0.0 Safari/537.36 Edg/${_chromium.split('.').first}.0.0.0',
+              'Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0',
       'Accept-Language': 'en-US,en;q=0.9',
+      'Cookie': 'muid=${_muid()};',
     }).timeout(const Duration(seconds: 20));
 
     final out = BytesBuilder();
@@ -165,12 +198,13 @@ class EdgeTts {
   }) async {
     final chunks = split(text);
     if (chunks.isEmpty) throw Exception('Please enter some text.');
+    await _syncClock();
     final all = BytesBuilder();
     for (var i = 0; i < chunks.length; i++) {
       onProgress?.call(i, chunks.length);
       Uint8List? data;
       Object? lastErr;
-      for (var attempt = 0; attempt < 3 && data == null; attempt++) {
+      for (var attempt = 0; attempt < 4 && data == null; attempt++) {
         try {
           final d = await _synthChunk(chunks[i], rate, pitch);
           if (d.isNotEmpty) {
@@ -181,6 +215,7 @@ class EdgeTts {
         } catch (e) {
           lastErr = e;
           await Future.delayed(const Duration(seconds: 1));
+          await _syncClock();
         }
       }
       if (data == null) throw Exception('Failed on part ${i + 1}/${chunks.length}: $lastErr');
