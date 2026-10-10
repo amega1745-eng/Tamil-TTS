@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.system);
 
@@ -139,7 +140,7 @@ class EdgeTts {
       onProgress?.call(i, chunks.length);
       Uint8List? data;
       Object? lastErr;
-      for (var attempt = 0; attempt < 3 && data == null; attempt++) {
+      for (var attempt = 0; attempt < 5 && data == null; attempt++) {
         try {
           final d = await _chunk(chunks[i], rate, pitch);
           if (d.isNotEmpty) {
@@ -149,7 +150,7 @@ class EdgeTts {
           }
         } catch (e) {
           lastErr = e;
-          await Future.delayed(const Duration(seconds: 2));
+          await Future.delayed(const Duration(seconds: 3));
         }
       }
       if (data == null) throw Exception('Failed on part ${i + 1}/${chunks.length}: $lastErr');
@@ -191,6 +192,48 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  /// Keeps the app's network alive while you use other apps.
+  Future<void> _startKeepAlive() async {
+    try {
+      final p = await FlutterForegroundTask.checkNotificationPermission();
+      if (p != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      FlutterForegroundTask.init(
+        androidNotificationOptions: AndroidNotificationOptions(
+          channelId: 'tamil_voice_convert',
+          channelName: 'Audio conversion',
+          channelDescription: 'Shown while Tamil text is being converted to audio.',
+          channelImportance: NotificationChannelImportance.LOW,
+          priority: NotificationPriority.LOW,
+        ),
+        iosNotificationOptions: const IOSNotificationOptions(
+          showNotification: false,
+          playSound: false,
+        ),
+        foregroundTaskOptions: ForegroundTaskOptions(
+          eventAction: ForegroundTaskEventAction.nothing(),
+          autoRunOnBoot: false,
+          allowWakeLock: true,
+          allowWifiLock: true,
+        ),
+      );
+      await FlutterForegroundTask.startService(
+        serviceId: 301,
+        notificationTitle: 'Tamil Voice',
+        notificationText: 'Converting text to audio...',
+      );
+    } catch (_) {
+      // If this fails the app still works while it stays open.
+    }
+  }
+
+  Future<void> _stopKeepAlive() async {
+    try {
+      await FlutterForegroundTask.stopService();
+    } catch (_) {}
+  }
+
   Future<void> _generate() async {
     FocusScope.of(context).unfocus();
     if (_text.text.trim().isEmpty) {
@@ -204,6 +247,7 @@ class _HomePageState extends State<HomePage> {
       _audio = null;
       _status = 'Generating audio... (the first time may take up to a minute)';
     });
+    await _startKeepAlive();
     try {
       final bytes = await EdgeTts.synthesize(
         _text.text,
@@ -213,13 +257,16 @@ class _HomePageState extends State<HomePage> {
           if (mounted) setState(() => _status = 'Generating audio... $d / $t parts done');
         },
       );
-      setState(() {
-        _audio = bytes;
-        _status = 'Done! You can play or download the MP3.';
-      });
+      if (mounted) {
+        setState(() {
+          _audio = bytes;
+          _status = 'Done! You can play or download the MP3.';
+        });
+      }
     } catch (e) {
-      setState(() => _status = 'Error: $e\nCheck your internet and try again.');
+      if (mounted) setState(() => _status = 'Error: $e\nCheck your internet and try again.');
     } finally {
+      await _stopKeepAlive();
       if (mounted) setState(() => _busy = false);
     }
   }
